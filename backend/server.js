@@ -1,26 +1,29 @@
-// server.js
+// backend/server.js
 
 import dotenv from 'dotenv';
 dotenv.config({ path: './.env' });
 import http from 'http';
-import app from './app.js';
+import app from './app.js'; // Assuming your Express app is configured in app.js
 import { Server } from 'socket.io';
 import mongoose from 'mongoose';
 import projectModel from './models/project.model.js';
 import userModel from './models/user.model.js';
 import { generateStreamingResponse } from './services/ai.service.js';
 
+// --- Vercel does not support persistent WebSocket connections in the same way.
+// --- We will keep the HTTP server logic for now, but be aware of Vercel's serverless nature.
+
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*" }
 });
 
+// ... your entire io setup (io.use, io.on, etc.) remains exactly the same ...
 let aiUserId;
 userModel.findOrCreateAIUser().then(aiUser => {
     aiUserId = aiUser._id;
     console.log(`AI User is ready with ID: ${aiUserId}`);
 });
-
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.split(' ')[1];
@@ -36,7 +39,6 @@ io.use(async (socket, next) => {
         next(new Error("Authentication failed"));
     }
 });
-
 io.on('connection', socket => {
     if (!socket.project) {
         socket.disconnect();
@@ -95,9 +97,21 @@ io.on('connection', socket => {
                     try {
                         const parsedResponse = JSON.parse(fullResponse);
                         if (parsedResponse && parsedResponse.fileTree) {
+                            const newFileTree = parsedResponse.fileTree;
+                            const fileTreeString = JSON.stringify(newFileTree);
+
+                            await projectModel.findByIdAndUpdate(projectId, {
+                                $set: { fileTree: fileTreeString }
+                            });
+
+                            io.to(roomId).emit('files-updated', newFileTree);
+                            console.log(`✅ AI updated files for project: ${projectId}`);
+
                             responseToSaveInChat = parsedResponse.text || "I've updated the files for you.";
                         }
-                    } catch (e) { /* Is conversational text */ }
+                    } catch (e) {
+                        console.log("ℹ️ AI response was not JSON, treated as plain text.");
+                    }
                     
                     await projectModel.updateOne(
                         { "messages._id": savedPlaceholder._id },
@@ -131,7 +145,17 @@ io.on('connection', socket => {
     });
 });
 
-const port = process.env.PORT || 3001;
-server.listen(port, () => {
-    console.log(`Server is listening on port ${port}`);
-});
+
+// ✅ THIS IS THE CRITICAL CHANGE
+// Vercel handles the server listening. We just need to export the app.
+// We keep the server.listen for local development.
+
+if (process.env.NODE_ENV !== 'production') {
+    const port = process.env.PORT || 3001;
+    server.listen(port, () => {
+        console.log(`Server is listening on port ${port} for local development`);
+    });
+}
+
+// Export the app for Vercel's serverless environment
+export default app;
