@@ -150,12 +150,12 @@ io.on('connection', socket => {
 // Vercel handles the server listening. We just need to export the app.
 // We keep the server.listen for local development.
 
-if (process.env.NODE_ENV !== 'production') {
+ 
     const port = process.env.PORT || 3001;
     server.listen(port, () => {
         console.log(`Server is listening on port ${port} for local development`);
     });
-}
+
 
 // Export the app for Vercel's serverless environment
 export default app;
