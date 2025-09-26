@@ -1,4 +1,3 @@
-
 // screens/project.jsx
 
 import React, { useState, useEffect, useContext, useRef } from "react";
@@ -48,9 +47,12 @@ const Project = () => {
   const [Message, setMessage] = useState("");
   const [messages, setMessages] = useState([]);
   const messagesEndRef = useRef(null);
-  const [fileTree, setFileTree] = useState({});
-  const [currentFile, setCurrentFile] = useState(null);
-  const [openFiles, setopenFiles] = useState([]);
+
+  // ✅ REFACTORED STATE: Use an array of objects with stable IDs for files.
+  const [files, setFiles] = useState([]);
+  const [activeFileId, setActiveFileId] = useState(null);
+  
+  const [openFiles, setopenFiles] = useState([]); // Tracks open tabs by filename
   const [webContainer, setWebContainer] = useState(null);
   const [highlightedCode, setHighlightedCode] = useState("");
   const preRef = useRef(null);
@@ -62,20 +64,51 @@ const Project = () => {
   const [isCompilerVisible, setIsCompilerVisible] = useState(false);
   const [compilerStatus, setCompilerStatus] = useState("idle");
 
-  // ✅ FIX: Use a ref to keep track of the latest fileTree to avoid stale closures
-  const fileTreeRef = useRef(fileTree);
+  // ✅ REF: Holds the latest 'files' array to prevent stale state in websocket callbacks.
+  const filesRef = useRef(files);
   useEffect(() => {
-    fileTreeRef.current = fileTree;
-  }, [fileTree]);
+    filesRef.current = files;
+  }, [files]);
+
+  // ✅ DERIVED STATE: Cleanly get the active file object from the state.
+  const activeFile = React.useMemo(
+    () => files.find((f) => f.id === activeFileId) || null,
+    [files, activeFileId]
+  );
+  
+  // ✅ EFFECT: Ensure an active file is always selected if files exist.
+  useEffect(() => {
+    if (files.length > 0 && !files.some((f) => f.id === activeFileId)) {
+      setActiveFileId(files[0].id);
+    }
+  }, [files, activeFileId]);
+  
+  // ✅ UTILITY: Generate a unique ID for new files.
+  const generateId = () =>
+    crypto?.randomUUID?.() ||
+    `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
   const formatTime = (timestamp) => {
     if (!timestamp) return "";
-    return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+    return new Date(timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    });
   };
 
   // --- LIFECYCLE & DATA HANDLING ---
   useEffect(() => {
-    const init = async () => { if (!webContainer) { try { const instance = await getWebContainerInstance(); setWebContainer(instance); } catch (err) { console.error("Error creating WebContainer instance:", err); } } };
+    const init = async () => {
+      if (!webContainer) {
+        try {
+          const instance = await getWebContainerInstance();
+          setWebContainer(instance);
+        } catch (err) {
+          console.error("Error creating WebContainer instance:", err);
+        }
+      }
+    };
     init();
   }, [webContainer]);
 
@@ -84,32 +117,35 @@ const Project = () => {
   }, [messages]);
 
   useEffect(() => {
-    const content = fileTree[currentFile]?.content;
-    if (typeof content === "string") {
-      const language = currentFile.split(".").pop();
+    if (activeFile && activeFile.content) {
+      const language = activeFile.name.split(".").pop();
       let highlighted;
-      if (language && hljs.getLanguage(language)) { highlighted = hljs.highlight(content, { language }).value; } else { highlighted = hljs.highlightAuto(content).value; }
+      if (language && hljs.getLanguage(language)) {
+        highlighted = hljs.highlight(activeFile.content, { language }).value;
+      } else {
+        highlighted = hljs.highlightAuto(activeFile.content).value;
+      }
       setHighlightedCode(highlighted);
     } else {
-      setHighlightedCode("");
+        setHighlightedCode("");
     }
-  }, [fileTree, currentFile]);
+  }, [activeFile]);
 
   useEffect(() => {
     const projectId = location.state?.project?._id;
     if (!projectId) return;
 
     const socket = initiateSocketConnection(projectId);
-    
+
     const handleProjectMessage = (data) => {
-        setMessages((prev) => {
-            const messageExists = prev.some(msg => msg._id === data._id);
-            if (messageExists) {
-                return prev.map(msg => msg._id === data._id ? data : msg);
-            } else {
-                return [...prev, data];
-            }
-        });
+      setMessages((prev) => {
+        const messageExists = prev.some((msg) => msg._id === data._id);
+        if (messageExists) {
+          return prev.map((msg) => (msg._id === data._id ? data : msg));
+        } else {
+          return [...prev, data];
+        }
+      });
     };
     const handleAiChunk = (data) => setMessages((prev) => prev.map((msg) => msg._id === data._id ? { ...msg, Message: (msg.Message || "") + data.chunk, isLoading: false, isStreaming: true } : msg));
     const handleAiError = (data) => setMessages((prev) => prev.map((msg) => msg._id === data._id ? { ...data, isLoading: false, isStreaming: false } : msg));
@@ -118,44 +154,47 @@ const Project = () => {
         setMessages((prev) => prev.map((msg) => {
             if (msg._id === data._id) {
                 const finalMsg = { ...msg, isLoading: false, isStreaming: false, timestamp: data.timestamp };
-                
                 try {
                     const parsed = JSON.parse(finalMsg.Message);
-                    
                     if (parsed && typeof parsed === "object" && parsed.fileTree) {
-                        const newOrModifiedFiles = parsed.fileTree;
-                        // ✅ FIX: Use the ref here to get the most up-to-date fileTree state
-                        setFileTree({
-                            ...fileTreeRef.current,
-                            ...newOrModifiedFiles
-                        });
+                        const incomingFiles = parsed.fileTree;
+                        setFiles((prevFiles) => {
+                            const filesMap = new Map(prevFiles.map(f => [f.name, f]));
+                            const newFileNames = [];
 
-                        const newFileNames = Object.keys(newOrModifiedFiles);
-                        setopenFiles(prevOpenFiles => [...new Set([...prevOpenFiles, ...newFileNames])]);
-                        
-                        if (newFileNames.length > 0) {
-                            setCurrentFile(newFileNames[0]);
-                        }
-                        
+                            Object.entries(incomingFiles).forEach(([name, { content }]) => {
+                                const existingFile = filesMap.get(name);
+                                if (existingFile) {
+                                    filesMap.set(name, { ...existingFile, content });
+                                } else {
+                                    filesMap.set(name, { id: generateId(), name, content });
+                                    newFileNames.push(name);
+                                }
+                            });
+
+                            if (newFileNames.length > 0) {
+                                setopenFiles(prev => [...new Set([...prev, ...newFileNames])]);
+                                const firstNewFile = filesMap.get(newFileNames[0]);
+                                if (firstNewFile) setActiveFileId(firstNewFile.id);
+                            }
+                            
+                            return Array.from(filesMap.values());
+                        });
                         return { ...finalMsg, Message: parsed.text || "I've updated the files for you." };
                     }
                 } catch (e) {
                     console.log("AI response was conversational text.");
                 }
-                
                 return finalMsg;
             }
             return msg;
         }));
     };
-    
-    const handleFilesUpdated = (newFileTree) => setFileTree(newFileTree);
 
     receiveMessage("project-message", handleProjectMessage);
     receiveMessage("ai-message-chunk", handleAiChunk);
     receiveMessage("ai-message-end", handleAiEnd);
     receiveMessage("ai-message-error", handleAiError);
-    receiveMessage("files-updated", handleFilesUpdated);
 
     const fetchData = async () => {
       try {
@@ -164,12 +203,20 @@ const Project = () => {
         setProject(fetchedProject);
         if (fetchedProject.users) setAddedPartners(fetchedProject.users);
         if (fetchedProject.messages) setMessages(fetchedProject.messages);
+
         if (fetchedProject.fileTree && Object.keys(fetchedProject.fileTree).length > 0) {
-            setFileTree(fetchedProject.fileTree);
-            const savedFiles = Object.keys(fetchedProject.fileTree);
-            setopenFiles(savedFiles);
-            setCurrentFile(savedFiles[0]);
+            const initialFiles = Object.entries(fetchedProject.fileTree).map(([name, { content }]) => ({
+                id: generateId(),
+                name,
+                content,
+            }));
+            setFiles(initialFiles);
+            setopenFiles(initialFiles.map(f => f.name));
+            if (initialFiles.length > 0) {
+                setActiveFileId(initialFiles[0].id);
+            }
         }
+
         const usersRes = await axios.get("/users/all");
         setUsers(usersRes.data.users);
       } catch (err) {
@@ -183,38 +230,58 @@ const Project = () => {
       socket.off("ai-message-chunk", handleAiChunk);
       socket.off("ai-message-end", handleAiEnd);
       socket.off("ai-message-error", handleAiError);
-      socket.off("files-updated", handleFilesUpdated);
     };
   }, [location.state?.project?._id]);
 
   useEffect(() => {
     const debounceSave = setTimeout(() => {
-      if (project?._id && fileTree) {
-        sendMessage('update-files', { projectId: project._id, fileTree });
+      if (project?._id && files.length > 0) {
+        const fileTreeToSend = files.reduce((acc, file) => {
+            acc[file.name] = { content: file.content };
+            return acc;
+        }, {});
+        sendMessage("update-files", { projectId: project._id, fileTree: fileTreeToSend });
       }
     }, 1500);
     return () => clearTimeout(debounceSave);
-  }, [fileTree, project]);
+  }, [files, project]);
 
   useEffect(() => {
-    if (!currentFile) return;
+    if (!activeFile) return;
     const extensionToLanguageMap = { cpp: "cpp", c: "c", java: "java", py: "python", js: "javascript" };
-    const fileExtension = currentFile.split(".").pop();
+    const fileExtension = activeFile.name.split(".").pop();
     const language = extensionToLanguageMap[fileExtension];
     if (language) setLanguageId(language);
-  }, [currentFile]);
+  }, [activeFile]);
 
   // --- HANDLER FUNCTIONS ---
-  const handleDeleteFile = (e, fileToDelete) => {
+  const handleSelectFile = (id) => {
+      setActiveFileId(id);
+      const file = files.find(f => f.id === id);
+      if (file && !openFiles.includes(file.name)) {
+          setopenFiles(prev => [...prev, file.name]);
+      }
+  };
+  
+  const handleDeleteFile = (e, fileIdToDelete) => {
     e.stopPropagation();
-    const newFileTree = { ...fileTree };
-    delete newFileTree[fileToDelete];
-    setFileTree(newFileTree);
-    const newOpenFiles = openFiles.filter(f => f !== fileToDelete);
-    setopenFiles(newOpenFiles);
-    if (currentFile === fileToDelete) {
-      setCurrentFile(newOpenFiles[0] || null);
+    const fileToDelete = files.find(f => f.id === fileIdToDelete);
+    if (!fileToDelete) return;
+
+    setFiles((prev) => prev.filter((f) => f.id !== fileIdToDelete));
+    setopenFiles((prev) => prev.filter((name) => name !== fileToDelete.name));
+    
+    if (activeFileId === fileIdToDelete) {
+      const remainingFiles = files.filter((f) => f.id !== fileIdToDelete);
+      setActiveFileId(remainingFiles[0]?.id || null);
     }
+  };
+
+  const handleChangeContent = (e) => {
+    const newContent = e.target.value;
+    setFiles((prev) =>
+      prev.map((f) => (f.id === activeFileId ? { ...f, content: newContent } : f))
+    );
   };
   
   const handleAddPartner = async () => {
@@ -234,16 +301,50 @@ const Project = () => {
     } catch (err) { console.error("Error removing partner:", err); }
   };
   
-  const handleRunClick = () => { if (currentFile && fileTree[currentFile]) { setSourceCode(fileTree[currentFile].content); } setCompilerStatus("idle"); setCompilerOutput(""); setIsCompilerVisible(true); };
-  const handleRunCode = async () => { if (!sourceCode.trim()) { setCompilerOutput("Please enter some code to run."); setCompilerStatus("error"); return; } setIsCompiling(true); setCompilerStatus("running"); setCompilerOutput("Running code..."); try { const response = await axios.post("/api/code/run", { source_code: sourceCode, language: languageId, stdin: "" }); const { stdout, stderr, compile_output, message, status } = response.data; if (status.id === 6) { setCompilerOutput(compile_output || stderr || "Compilation Error"); setCompilerStatus("error"); } else if (status.id !== 3) { setCompilerOutput(stderr || message || `Error: ${status.description}`); setCompilerStatus("error"); } else { setCompilerOutput(stdout || "Execution successful, but no output."); setCompilerStatus("success"); } } catch (error) { const errorMessage = error.response?.data?.error || "An unexpected error occurred."; setCompilerOutput(errorMessage); setCompilerStatus("error"); } finally { setIsCompiling(false); } };
+  const handleRunClick = () => { if (activeFile) { setSourceCode(activeFile.content); } setCompilerStatus("idle"); setCompilerOutput(""); setIsCompilerVisible(true); };
+  
+  const handleRunCode = async () => { 
+      if (!sourceCode.trim()) { 
+          setCompilerOutput("Please enter some code to run."); 
+          setCompilerStatus("error"); 
+          return; 
+      } 
+      setIsCompiling(true); 
+      setCompilerStatus("running"); 
+      setCompilerOutput("Running code..."); 
+      try { 
+          const response = await axios.post("/api/code/run", { source_code: sourceCode, language: languageId, stdin: "" }); 
+          const { stdout, stderr, compile_output, message, status } = response.data; 
+          if (status.id === 6) { 
+              setCompilerOutput(compile_output || stderr || "Compilation Error"); 
+              setCompilerStatus("error"); 
+          } else if (status.id !== 3) { 
+              setCompilerOutput(stderr || message || `Error: ${status.description}`); 
+              setCompilerStatus("error"); 
+          } else { 
+              setCompilerOutput(stdout || "Execution successful, but no output."); 
+              setCompilerStatus("success"); 
+          } 
+      } catch (error) { 
+          const errorMessage = error.response?.data?.error || "An unexpected error occurred."; 
+          setCompilerOutput(errorMessage); 
+          setCompilerStatus("error"); 
+      } finally { 
+          setIsCompiling(false); 
+      } 
+  };
   
   const send = () => { 
-    if (!user || !Message?.trim() || !project) return; 
+    if (!user || !Message?.trim() || !project) return;
+    const fileTreeToSend = filesRef.current.reduce((acc, file) => {
+        acc[file.name] = { content: file.content };
+        return acc;
+    }, {});
     sendMessage("project-message", { 
         Message, 
         sender: user, 
         projectId: project._id,
-        fileTree: fileTreeRef.current // ✅ FIX: Send the most up-to-date fileTree from the ref
+        fileTree: fileTreeToSend
     }); 
     setMessage(""); 
   };
@@ -287,7 +388,8 @@ const Project = () => {
                     <div ref={messagesEndRef} />
                 </div>
                 <div className="flex items-center p-3 bg-gray-800 flex-shrink-0 shadow-inner border-t border-gray-700">
-                    <input type="text" value={Message} onChange={(e) => setMessage(e.target.value)} onKeyPress={(e) => e.key === "Enter" && send()} placeholder="Type your prompt here..." className="flex-1 p-3 rounded-xl border border-gray-600 bg-gray-700 text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-gray-400" />
+                    <input type="text" value={Message} onChange={(e) => setMessage(e.target.value)} onKeyPress={(e) => e.key === "Enter" && send()} placeholder="start from @ to chat with AI...
+                    " className="flex-1 p-3 rounded-xl border border-gray-600 bg-gray-700 text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-gray-400" />
                     <button onClick={send} disabled={!Message?.trim()} className="ml-3 px-5 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed transition"><i className="ri-send-plane-fill text-lg"></i></button>
                 </div>
             </div>
@@ -333,26 +435,46 @@ const Project = () => {
         </section>
 
         <section className="bg-gray-800 text-white flex-grow h-full flex flex-col overflow-hidden relative">
-            {Object.keys(fileTree).length > 0 ? (
+            {files.length > 0 ? (
             <div className="flex-grow flex h-full overflow-hidden">
                 <div className="explorer w-52 bg-gray-900 py-5 flex-shrink-0 h-full overflow-y-auto border-r border-gray-700">
                     <h3 className="px-4 text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Explorer</h3>
                     <div className="file-tree w-full flex gap-1 flex-col mx-auto px-2">
-                        {Object.keys(fileTree).map((file) => (
-                            <div key={file} className={`group flex items-center justify-between p-2 rounded-md w-full text-left text-gray-300 transition cursor-pointer ${currentFile === file ? "bg-blue-600/20 text-blue-300" : "hover:bg-gray-700/50"}`} onClick={() => { setCurrentFile(file); if (!openFiles.includes(file)) setopenFiles((prev) => [...prev, file]); }}>
-                                <p className="truncate text-sm">{file}</p>
-                                <button onClick={(e) => handleDeleteFile(e, file)} className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 transition-opacity ml-2" title={`Delete ${file}`}><i className="ri-close-line"></i></button>
+                        {files.map((file) => (
+                            <div key={file.id} 
+                                 className={`group flex items-center justify-between p-2 rounded-md w-full text-left text-gray-300 transition cursor-pointer ${activeFileId === file.id ? "bg-blue-600/20 text-blue-300" : "hover:bg-gray-700/50"}`} 
+                                 onClick={() => handleSelectFile(file.id)}>
+                                <p className="truncate text-sm">{file.name}</p>
+                                <button onClick={(e) => handleDeleteFile(e, file.id)} className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 transition-opacity ml-2" title={`Delete ${file.name}`}><i className="ri-close-line"></i></button>
                             </div>
                         ))}
                     </div>
                 </div>
-                {currentFile && ( <div className="code-editor flex-1 flex flex-col h-full overflow-hidden">
+                {activeFile && ( <div className="code-editor flex-1 flex flex-col h-full overflow-hidden">
                     <header className="top flex justify-between items-center flex-shrink-0 bg-gray-900 border-b border-gray-700">
-                        <div className="flex overflow-x-auto">{openFiles.map((file) => (<button key={file} onClick={() => setCurrentFile(file)} className={`open-file flex-shrink-0 cursor-pointer px-4 py-2.5 border-b-2 text-sm transition ${currentFile === file ? "border-blue-500 bg-gray-800 text-white font-semibold" : "border-transparent text-gray-400 hover:bg-gray-700/50"}`}><p className="whitespace-nowrap">{file}</p></button>))}</div>
+                        <div className="flex overflow-x-auto">
+                            {openFiles.map((fileName) => {
+                                const file = files.find(f => f.name === fileName);
+                                if (!file) return null;
+                                return (
+                                    <button key={file.id} 
+                                            onClick={() => handleSelectFile(file.id)} 
+                                            className={`open-file flex-shrink-0 cursor-pointer px-4 py-2.5 border-b-2 text-sm transition ${activeFileId === file.id ? "border-blue-500 bg-gray-800 text-white font-semibold" : "border-transparent text-gray-400 hover:bg-gray-700/50"}`}>
+                                        <p className="whitespace-nowrap">{file.name}</p>
+                                    </button>
+                                );
+                            })}
+                        </div>
                         <button onClick={handleRunClick} className="flex-shrink-0 flex items-center gap-2 mr-4 px-4 py-1.5 bg-green-600 text-white font-semibold rounded-md hover:bg-green-700 transition"><i className="ri-play-fill text-lg"></i> Run</button>
                     </header>
                     <div className="bottom flex-1 flex flex-col relative overflow-hidden bg-[#1e1e1e]">
-                        <textarea ref={textareaRef} value={fileTree[currentFile]?.content || ""} onChange={(e) => setFileTree((prev) => ({ ...prev, [currentFile]: { ...prev[currentFile], content: e.target.value } }))} onScroll={(e) => { if (preRef.current) { preRef.current.scrollTop = e.currentTarget.scrollTop; preRef.current.scrollLeft = e.currentTarget.scrollLeft; }}} className="absolute inset-0 w-full h-full p-4 text-base bg-transparent text-transparent caret-white outline-none resize-none overflow-auto font-mono z-10 leading-relaxed" spellCheck="false" />
+                        <textarea 
+                            ref={textareaRef} 
+                            value={activeFile.content} 
+                            onChange={handleChangeContent} 
+                            onScroll={(e) => { if (preRef.current) { preRef.current.scrollTop = e.currentTarget.scrollTop; preRef.current.scrollLeft = e.currentTarget.scrollLeft; }}} 
+                            className="absolute inset-0 w-full h-full p-4 text-base bg-transparent text-transparent caret-white outline-none resize-none overflow-auto font-mono z-10 leading-relaxed" spellCheck="false" 
+                        />
                         <pre ref={preRef} className="absolute inset-0 w-full h-full p-4 text-base outline-none resize-none overflow-auto font-mono pointer-events-none leading-relaxed" aria-hidden="true"><code dangerouslySetInnerHTML={{ __html: highlightedCode }} /></pre>
                     </div>
                 </div>)}
@@ -364,6 +486,7 @@ const Project = () => {
                     <p className="text-gray-500">Ask the AI to generate code to get started.</p>
                 </div>
             )}
+            
             <div className={`compiler-container absolute bottom-0 left-0 w-full h-[45vh] bg-gray-900 border-t-2 border-gray-700 shadow-2xl transform transition-transform duration-500 ease-in-out z-30 ${isCompilerVisible ? 'translate-y-0' : 'translate-y-full'}`}>
                 <div className="compiler-section p-4 flex flex-col gap-3 h-full">
                     <div className="flex justify-between items-center flex-shrink-0">
